@@ -36,4 +36,337 @@
   <h1>Voci-Trainer</h1>
 
   <div class="row">
-    <span class="pill">Mode: <strong id=
+    <span class="pill">Mode: <strong id="modeLabel">Lenient</strong></span>
+    <span class="pill">Seed: <span id="seedLabel">1</span></span>
+    <span class="pill">Richtung: <strong id="dirLabel">DE → FR</strong></span>
+    <span class="pill" id="scorePill">0 / 0</span>
+    <span class="pill">Punkte: <strong id="pointsPill">0</strong></span>
+    <span class="pill">Rating: <strong id="ratingPill">☆☆☆☆☆</strong></span>
+  </div>
+
+  <div class="card">
+    <div class="controls">
+      <div class="group">
+        <button id="shuffleBtn">Shuffle</button>
+      </div>
+      <div class="group">
+        <label class="small"><input type="checkbox" id="strict"> Strict (Akzente Pflicht – betrifft FR-Seite)</label>
+      </div>
+      <div class="group">
+        <label class="small"><input type="radio" name="dir" value="DE2FR" checked> DE → FR</label>
+        <label class="small"><input type="radio" name="dir" value="FR2DE"> FR → DE</label>
+      </div>
+      <div class="group">
+        <input id="csvInput" type="file" accept=".csv,text/csv" />
+        <button id="downloadCsv" class="secondary">CSV export</button>
+      </div>
+    </div>
+    <div class="muted small" style="margin-top:6px">
+      CSV-Format: <code>French,German,Example</code> (Delimiter <b>;</b> oder <b>,</b>, mit/ohne Kopfzeile, Anführungszeichen erlaubt).
+    </div>
+  </div>
+
+  <div class="card" id="card">
+    <div class="muted small" id="promptLang">Deutsch</div>
+    <div id="prompt" style="font-size:20px;margin:6px 0 8px 0;font-weight:600"></div>
+
+    <div class="muted small" id="answerHint">Schreibe die französische Übersetzung</div>
+    <input id="answer" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="votre réponse…">
+
+    <div style="margin-top:10px" class="row">
+      <button id="checkBtn">Prüfen</button>
+      <button id="nextBtn" class="secondary">Weiter</button>
+      <button id="showBtn" class="secondary">Lösung</button>
+    </div>
+
+    <div id="feedback" class="result" style="margin-top:10px"></div>
+    <div id="correct" class="muted" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <div class="muted small">
+      Tipp: In Safari → Teilen → „Zum Home-Bildschirm“ (App läuft offline). Bei Updates ggf. Cache-Version in <code>sw.js</code> erhöhen.
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <div class="row">
+    <div class="muted small">Works offline nach dem ersten Laden.</div>
+    <div class="muted small"><a href="#" id="install" style="text-decoration:none">Install</a></div>
+  </div>
+</div>
+
+<!-- Vokabeldaten (Fallback aus data.js) -->
+<script src="data.js"></script>
+<script>
+  /* ========= Hilfsfunktionen ========= */
+  function lcg(seed){ let s = seed>>>0; return ()=> (s = (s*1664525 + 1013904223)>>>0) / 2**32; }
+
+  // French Akzente falten (für Lenient)
+  const foldMap = {'é':'e','è':'e','ê':'e','à':'a','â':'a','î':'i','ï':'i','ô':'o','ù':'u','û':'u','ç':'c','œ':'oe','’':"'"};
+  function foldFR(s){ return s.toLowerCase().trim().replace(/[éèêàâîïôùûçœ’,.]/g, ch=>foldMap[ch]||'').replace(/\s{2,}/g,' '); }
+  function normStrict(s){ return s.toLowerCase().trim().replace(/\s{2,}/g,' '); }
+  function normDE(s){ return s.toLowerCase().trim().replace(/\s{2,}/g,' '); }
+
+  // Einfacher CSV-Parser (Komma ODER Semikolon, mit Quotes)
+  function parseCSV(text){
+    const delimiter = (text.indexOf(';')> -1 && text.indexOf(',')===-1) ? ';' : ',';
+    const rows = []; let i=0, cur='', inQ=false; const push=()=>{ (rows[rows.length-1]||rows.push([]),0); rows[rows.length-1].push(cur); cur=''; };
+    rows.push([]);
+    while(i<text.length){
+      const c = text[i];
+      if(inQ){
+        if(c==='"' && text[i+1]==='"'){ cur+='"'; i+=2; continue; }
+        if(c==='"'){ inQ=false; i++; continue; }
+        cur+=c; i++; continue;
+      }
+      if(c==='"'){ inQ=true; i++; continue; }
+      if(c==='\r'){ i++; continue; }
+      if(c==='\n'){ push(); rows.push([]); i++; continue; }
+      if(c===delimiter){ push(); i++; continue; }
+      cur+=c; i++;
+    }
+    if(cur!=='' || text.endsWith(delimiter)) push();
+    if(rows.length && rows[rows.length-1].length===1 && rows[rows.length-1][0]==='') rows.pop();
+    return rows;
+  }
+
+  function exportCSV(rows){
+    const esc = v => {
+      const s = (v??'').toString();
+      return /[",;\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+    };
+    return rows.map(r=>r.map(esc).join(',')).join('\n');
+  }
+
+  /* ========= App-State ========= */
+  // Daten aus data.js (Fallback), Struktur: [fr, de, example]
+  let baseData = (window.VOCAB_DATA||[]).map(([fr,de,ex])=>({fr,de,ex}));
+  // CSV-Override aus localStorage
+  const savedCsv = localStorage.getItem('voci_csv');
+  if(savedCsv){
+    try {
+      const rows = parseCSV(savedCsv);
+      const header = rows[0].map(s=>s.trim().toLowerCase());
+      const hasHeader = header.includes('french') || header.includes('deutsch') || header.includes('german');
+      const dataRows = hasHeader ? rows.slice(1) : rows;
+      baseData = dataRows.filter(r=>r.length>=2).map(r=>({fr:r[0]||'', de:r[1]||'', ex:r[2]||''}));
+    } catch {}
+  }
+
+  let order = [], idx = 0;
+  let strict = (localStorage.getItem('voci_strict')==='1');
+  let direction = localStorage.getItem('voci_dir') || 'DE2FR'; // 'DE2FR' oder 'FR2DE'
+  let seed = parseInt(localStorage.getItem('voci_seed')||'1',10);
+
+  // Fortschritt / Punkte / Rating
+  let seen = parseInt(localStorage.getItem('voci_seen')||'0',10);
+  let correctCount = parseInt(localStorage.getItem('voci_correct')||'0',10);
+  let points = parseInt(localStorage.getItem('voci_points')||'0',10);
+  // Status je Item: 'u' (unbeantwortet), 'w' (falsch versucht), 'c' (korrekt abgeschlossen)
+  let status = JSON.parse(localStorage.getItem('voci_status')||'{}'); // key: itemIndex, value: 'u'|'w'|'c'
+  // Flag: hat der Nutzer die Lösung für das aktuelle Item angesehen?
+  let sawSolution = false;
+
+  const promptEl   = document.getElementById('prompt');
+  const promptLang = document.getElementById('promptLang');
+  const answerHint = document.getElementById('answerHint');
+  const answerEl   = document.getElementById('answer');
+  const feedbackEl = document.getElementById('feedback');
+  const correctEl  = document.getElementById('correct');
+  const scorePill  = document.getElementById('scorePill');
+  const modeLabel  = document.getElementById('modeLabel');
+  const seedLabel  = document.getElementById('seedLabel');
+  const dirLabel   = document.getElementById('dirLabel');
+  const pointsPill = document.getElementById('pointsPill');
+  const ratingPill = document.getElementById('ratingPill');
+
+  // UI init
+  document.getElementById('strict').checked = strict;
+  Array.from(document.querySelectorAll('input[name="dir"]')).forEach(r=>{
+    r.checked = (r.value===direction);
+  });
+  pointsPill.textContent = points;
+
+  function updateLabels(){
+    modeLabel.textContent = strict ? 'Strict' : 'Lenient';
+    dirLabel.textContent  = direction==='DE2FR' ? 'DE → FR' : 'FR → DE';
+    promptLang.textContent= direction==='DE2FR' ? 'Deutsch' : 'Französisch';
+    answerHint.textContent= direction==='DE2FR' ? 'Schreibe die französische Übersetzung' : 'Schreibe die deutsche Übersetzung';
+    scorePill.textContent = `${correctCount} / ${seen}`;
+    updateRating();
+  }
+
+  function updateRating(){
+    const total = seen || 1;
+    const perc = (correctCount/total)*100;
+    let stars = 0;
+    if(perc>=90) stars=5;
+    else if(perc>=75) stars=4;
+    else if(perc>=60) stars=3;
+    else if(perc>=40) stars=2;
+    else if(perc>=20) stars=1;
+    ratingPill.textContent = '★'.repeat(stars) + '☆'.repeat(5-stars);
+  }
+
+  function persistProgress(){
+    localStorage.setItem('voci_seen', String(seen));
+    localStorage.setItem('voci_correct', String(correctCount));
+    localStorage.setItem('voci_points', String(points));
+    localStorage.setItem('voci_status', JSON.stringify(status));
+  }
+
+  function shuffle(newSeed){
+    seed = newSeed || Math.floor(Math.random()*1e9);
+    localStorage.setItem('voci_seed', String(seed));
+    seedLabel.textContent = seed;
+    const rnd = lcg(seed);
+    order = baseData.map((_,i)=>[rnd(),i]).sort((a,b)=>a[0]-b[0]).map(x=>x[1]);
+    idx = 0;
+    sawSolution = false;
+    showCurrent();
+  }
+
+  function showCurrent(){
+    const q = baseData[order[idx]];
+    promptEl.textContent = (direction==='DE2FR') ? q.de : q.fr;
+    answerEl.value = '';
+    feedbackEl.textContent = '';
+    feedbackEl.className = 'result';
+    correctEl.textContent = '';
+    sawSolution = false;
+    updateLabels();
+  }
+
+  function normalizeLeft(s){
+    if(direction==='DE2FR'){
+      return strict ? normStrict(s) : foldFR(s);
+    } else {
+      return normDE(s);
+    }
+  }
+  function normalizeRight(s){
+    if(direction==='DE2FR'){
+      return strict ? normStrict(s) : foldFR(s);
+    } else {
+      return normDE(s);
+    }
+  }
+
+  function check(){
+    const itemIndex = order[idx];
+    const q = baseData[itemIndex];
+    const solution = (direction==='DE2FR') ? q.fr : q.de;
+    const a = answerEl.value;
+
+    const ok = normalizeLeft(a).length>0 && normalizeLeft(a)===normalizeRight(solution);
+
+    // Erstprüfung für dieses Item?
+    if(!status[itemIndex]){
+      status[itemIndex] = 'u';
+      seen++;
+    }
+
+    // Punkte / CorrectCount nur einmal, wenn Item erstmals korrekt wird
+    if(ok){
+      if(status[itemIndex] !== 'c'){
+        // Punkte: +10 beim ersten Versuch ohne Lösung, +5 wenn Lösung vorher gezeigt wurde, +0 wenn vorher falsch
+        if(status[itemIndex]==='u'){
+          points += sawSolution ? 5 : 10;
+        }
+        status[itemIndex] = 'c';
+        correctCount++;
+      }
+    } else {
+      // Markiere als falsch versucht, falls noch nicht korrekt
+      if(status[itemIndex] !== 'c'){
+        status[itemIndex] = 'w';
+      }
+    }
+
+    // UI-Feedback
+    feedbackEl.textContent = ok ? '✓ Richtig' : '✗ Falsch';
+    feedbackEl.className = 'result ' + (ok?'ok':'bad');
+    if(!ok) correctEl.textContent = 'Lösung: ' + solution;
+
+    // Persist & UI
+    persistProgress();
+    pointsPill.textContent = points;
+    scorePill.textContent = `${correctCount} / ${seen}`;
+    updateRating();
+  }
+
+  document.getElementById('checkBtn').onclick   = check;
+  document.getElementById('showBtn').onclick    = ()=>{
+    const q = baseData[order[idx]];
+    const solution = (direction==='DE2FR') ? q.fr : q.de;
+    correctEl.textContent = 'Lösung: ' + solution;
+    sawSolution = true;
+  };
+  document.getElementById('nextBtn').onclick    = ()=>{ idx=(idx+1)%order.length; showCurrent(); };
+  document.getElementById('shuffleBtn').onclick = ()=> shuffle(seed+1);
+  document.getElementById('strict').onchange    = (e)=>{ strict=e.target.checked; localStorage.setItem('voci_strict', strict?'1':'0'); updateLabels(); };
+
+  // Richtung umschalten
+  Array.from(document.querySelectorAll('input[name="dir"]')).forEach(r=>{
+    r.addEventListener('change', ()=>{
+      if(r.checked){
+        direction = r.value;
+        localStorage.setItem('voci_dir', direction);
+        showCurrent();
+      }
+    });
+  });
+
+  // CSV Import
+  document.getElementById('csvInput').addEventListener('change', async (e)=>{
+    const file = e.target.files && e.target.files[0];
+    if(!file) return;
+    const text = await file.text();
+    try{
+      const rows = parseCSV(text);
+      const header = rows[0].map(s=>s.trim().toLowerCase());
+      const hasHeader = header.includes('french') || header.includes('franz') || header.includes('german') || header.includes('deutsch');
+      const dataRows = hasHeader ? rows.slice(1) : rows;
+      const parsed = dataRows.filter(r=>r.length>=2).map(r=>({fr:(r[0]||'').trim(), de:(r[1]||'').trim(), ex:(r[2]||'').trim()}));
+      if(parsed.length===0){ alert('CSV enthält keine verwertbaren Zeilen (min. 2 Spalten erforderlich).'); return; }
+      baseData = parsed;
+      localStorage.setItem('voci_csv', text);  // persist CSV Quelle
+      // Reset Fortschritt für neue Daten
+      seen=0; correctCount=0; points=0; status={};
+      persistProgress();
+      pointsPill.textContent=points;
+      shuffle(1);
+      alert('CSV geladen: ' + parsed.length + ' Einträge.');
+      e.target.value = '';
+    }catch(err){
+      console.error(err);
+      alert('CSV konnte nicht gelesen werden.');
+    }
+  });
+
+  // CSV Export (aktueller Datensatz -> CSV)
+  document.getElementById('downloadCsv').addEventListener('click', ()=>{
+    const rows = [['French','German','Example'], ...baseData.map(o=>[o.fr,o.de,o.ex])];
+    const csv = exportCSV(rows);
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'voci-trainer.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  // PWA: Service Worker + Install
+  if('serviceWorker' in navigator){ navigator.serviceWorker.register('./sw.js'); }
+  let deferredPrompt;
+  window.addEventListener('beforeinstallprompt', (e)=>{ e.preventDefault(); deferredPrompt=e; document.getElementById('install').onclick=()=>deferredPrompt.prompt(); });
+
+  // Start
+  document.getElementById('seedLabel').textContent = seed;
+  updateLabels();
+  shuffle(seed||1);
+</script>
+</body>
+</html>
